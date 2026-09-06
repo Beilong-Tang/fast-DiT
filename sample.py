@@ -16,13 +16,16 @@ from diffusers.models import AutoencoderKL
 from download import find_model
 from models import DiT_models
 import argparse
+from blpytorch.utils.log import setup_logger
 
 
 def main(args):
+    logger = setup_logger(".", 0)
     # Setup PyTorch:
     torch.manual_seed(args.seed)
     torch.set_grad_enabled(False)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"device: {device}")
 
     if args.ckpt is None:
         assert args.model == "DiT-XL/2", "Only DiT-XL/2 models are available for auto-download."
@@ -37,11 +40,15 @@ def main(args):
     ).to(device)
     # Auto-download a pre-trained model or load a custom DiT checkpoint from train.py:
     ckpt_path = args.ckpt or f"DiT-XL-2-{args.image_size}x{args.image_size}.pt"
+    logger.info("loading dit")
     state_dict = find_model(ckpt_path)
+    logger.info("loading dit done")
     model.load_state_dict(state_dict)
     model.eval()  # important!
     diffusion = create_diffusion(str(args.num_sampling_steps))
+    logger.info("loading vae")
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    logger.info("loading vae done")
 
     # Labels to condition the model with (feel free to change):
     class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
