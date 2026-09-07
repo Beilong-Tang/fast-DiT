@@ -216,3 +216,10 @@ logs/
 
 # model files
 *.pt
+
+# sample output
+
+samples/
+
+
+hpc_logs

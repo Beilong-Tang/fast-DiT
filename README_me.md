@@ -10,6 +10,7 @@
     to avoid installing in home directory.
 
 - run `sample.py` first to download the autoencoder together with pretrained DiT.
+    - run `sample.py` and specify the vae to be `ema`
 
 - the environment installs torch on cpu likely if install from login node, hence, we need to reinstall
     ```shell

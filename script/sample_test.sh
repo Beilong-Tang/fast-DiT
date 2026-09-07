@@ -6,4 +6,6 @@ export HF_HOME=/share/m1/btang5/hf                   # cache + tokens + everythi
 export HF_HUB_OFFLINE=1                              # IMPORTANT
 # python sample.py --image-size 256 --seed 1
 
-torchrun --nnodes=1 --nproc_per_node=1 sample_ddp.py --model DiT-XL/2 --num-fid-samples 50000
+
+# use ema
+python sample.py --image-size 256 --seed 1 --vae ema

@@ -11,6 +11,7 @@ evaluation metrics via the ADM repo: https://github.com/openai/guided-diffusion/
 
 For a simple single-GPU/CPU sampling script, see sample.py.
 """
+import time
 import torch
 import torch.distributed as dist
 from models import DiT_models
@@ -23,6 +24,8 @@ from PIL import Image
 import numpy as np
 import math
 import argparse
+from blpytorch.utils.log import setup_logger
+from blpytorch.utils.cuda_tracker import get_gpu_stats
 
 
 def create_npz_from_sample_folder(sample_dir, num=50_000):
@@ -47,17 +50,18 @@ def main(args):
     Run sampling.
     """
     torch.backends.cuda.matmul.allow_tf32 = args.tf32  # True: fast but may lead to some small numerical differences
+    logger.info(f"tf32 enabled: {args.tf32}")
     assert torch.cuda.is_available(), "Sampling with DDP requires at least one GPU. sample.py supports CPU-only usage"
     torch.set_grad_enabled(False)
 
     # Setup DDP:
     dist.init_process_group("nccl")
     rank = dist.get_rank()
+    logger = setup_logger("./logs/samples", rank) ## setup logging
     device = rank % torch.cuda.device_count()
-    seed = args.global_seed * dist.get_world_size() + rank
-    torch.manual_seed(seed)
     torch.cuda.set_device(device)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+
+    logger.info(f"Starting rank={rank}, world_size={dist.get_world_size()}.")
 
     if args.ckpt is None:
         assert args.model == "DiT-XL/2", "Only DiT-XL/2 models are available for auto-download."
@@ -88,25 +92,30 @@ def main(args):
     sample_folder_dir = f"{args.sample_dir}/{folder_name}"
     if rank == 0:
         os.makedirs(sample_folder_dir, exist_ok=True)
-        print(f"Saving .png samples at {sample_folder_dir}")
+        logger.info(f"Saving .png samples at {sample_folder_dir}")
     dist.barrier()
+    len_exist_samples = len(os.listdir(sample_folder_dir))
+    seed = args.global_seed * dist.get_world_size() + rank + len(len_exist_samples)
+    torch.manual_seed(seed)
 
     # Figure out how many samples we need to generate on each GPU and how many iterations we need to run:
     n = args.per_proc_batch_size
     global_batch_size = n * dist.get_world_size()
     # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
-    total_samples = int(math.ceil(args.num_fid_samples / global_batch_size) * global_batch_size)
+    total_samples = int(math.ceil((args.num_fid_samples - len_exist_samples) / global_batch_size) * global_batch_size)
     if rank == 0:
-        print(f"Total number of images that will be sampled: {total_samples}")
+        logger.info(f"Total number of images that will be sampled: {total_samples}")
     assert total_samples % dist.get_world_size() == 0, "total_samples must be divisible by world_size"
     samples_needed_this_gpu = int(total_samples // dist.get_world_size())
     assert samples_needed_this_gpu % n == 0, "samples_needed_this_gpu must be divisible by the per-GPU batch size"
     iterations = int(samples_needed_this_gpu // n)
+
     pbar = range(iterations)
     pbar = tqdm(pbar) if rank == 0 else pbar
-    total = 0
-    for _ in pbar:
+    total = len_exist_samples
+    for index, _ in enumerate(pbar):
         # Sample inputs:
+        time_start = time.time()
         z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
         y = torch.randint(0, args.num_classes, (n,), device=device)
 
@@ -136,12 +145,14 @@ def main(args):
             index = i * dist.get_world_size() + rank + total
             Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
         total += global_batch_size
+        pbar.set_description(get_gpu_stats())
+        logger.info(f"finished: {(index+1)/len(pbar)}, rate: {time.time() - time_start:.2f} sec/step")
 
     # Make sure all processes have finished saving their samples before attempting to convert to .npz
     dist.barrier()
     if rank == 0:
         create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples)
-        print("Done.")
+        logger.info("Done.")
     dist.barrier()
     dist.destroy_process_group()
 
