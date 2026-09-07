@@ -95,7 +95,7 @@ def main(args):
         logger.info(f"Saving .png samples at {sample_folder_dir}")
     dist.barrier()
     len_exist_samples = len(os.listdir(sample_folder_dir))
-    seed = args.global_seed * dist.get_world_size() + rank + len(len_exist_samples)
+    seed = args.global_seed * dist.get_world_size() + rank + len_exist_samples
     torch.manual_seed(seed)
 
     # Figure out how many samples we need to generate on each GPU and how many iterations we need to run:
