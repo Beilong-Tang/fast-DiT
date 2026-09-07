@@ -3,7 +3,7 @@
 #SBATCH --output=hpc_logs/%j_%x.out
 #SBATCH --error=hpc_logs/%j_%x.err
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:h100:1
+#SBATCH --gres=gpu:h100:2
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
@@ -23,4 +23,7 @@ export HF_HOME=/share/m1/btang5/hf                   # cache + tokens + everythi
 export HF_HUB_OFFLINE=1                              # IMPORTANT
 # python sample.py --image-size 256 --seed 1
 
-torchrun --nnodes=1 --nproc_per_node=1 sample_ddp.py --model DiT-XL/2 --num-fid-samples 50000
+nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used,memory.total \
+    --format=csv -l 30 > gpu_usage.log &
+
+torchrun --nnodes=1 --nproc_per_node=2 sample_ddp.py --model DiT-XL/2 --num-fid-samples 50000

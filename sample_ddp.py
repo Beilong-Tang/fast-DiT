@@ -134,6 +134,7 @@ def main(args):
         samples = diffusion.p_sample_loop(
             sample_fn, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device
         )
+        gpu_stats = get_gpu_stats()
         if using_cfg:
             samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
 
@@ -145,8 +146,7 @@ def main(args):
             index = i * dist.get_world_size() + rank + total
             Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
         total += global_batch_size
-        pbar.set_description(get_gpu_stats())
-        logger.info(f"finished: {(index+1)/len(pbar)}, rate: {time.time() - time_start:.2f} sec/step")
+        logger.info(f"finished: {(index+1)/len(pbar)}, rate: {time.time() - time_start:.2f} sec/step, {gpu_stats}")
 
     # Make sure all processes have finished saving their samples before attempting to convert to .npz
     dist.barrier()
