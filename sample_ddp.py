@@ -50,7 +50,6 @@ def main(args):
     Run sampling.
     """
     torch.backends.cuda.matmul.allow_tf32 = args.tf32  # True: fast but may lead to some small numerical differences
-    logger.info(f"tf32 enabled: {args.tf32}")
     assert torch.cuda.is_available(), "Sampling with DDP requires at least one GPU. sample.py supports CPU-only usage"
     torch.set_grad_enabled(False)
 
@@ -58,6 +57,7 @@ def main(args):
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     logger = setup_logger("./logs/samples", rank) ## setup logging
+    logger.info(f"tf32 enabled: {args.tf32}")
     device = rank % torch.cuda.device_count()
     torch.cuda.set_device(device)
 
