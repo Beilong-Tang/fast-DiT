@@ -20,19 +20,3 @@
     pip uninstall -y torch torchvision
     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
     ```
-    
-
-Example code to load dataset
-
-```python
-from datasets import load_dataset
-
-ds = load_dataset("parquet", data_files={"train": "/share/m1/btang5/data/2026-09-04/imagenet-256-hf/data/train-*.parquet"})
-
-## To build the dataset
-
-
-
-```
-
-
