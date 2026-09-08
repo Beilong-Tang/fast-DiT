@@ -32,6 +32,11 @@ from models import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 
+from accelerate.utils import set_seed
+
+from blpytorch.utils.log import setup_logger
+from blpytorch.utils.tim import ContextTimer
+
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -93,27 +98,52 @@ def center_crop_arr(pil_image, image_size):
     crop_x = (arr.shape[1] - image_size) // 2
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
-
+import bisect
 class CustomDataset(Dataset):
     def __init__(self, features_dir, labels_dir):
-        self.features_dir = features_dir
-        self.labels_dir = labels_dir
+        self.feature_paths = [os.path.join(features_dir, f) for f in sorted(os.listdir(features_dir))]
+        self.label_paths = [os.path.join(labels_dir, f) for f in sorted(os.listdir(labels_dir))]
+        assert len(self.feature_paths) == len(self.label_paths), \
+            "Number of feature files and label files should be same"
 
-        self.features_files = sorted(os.listdir(features_dir))
-        self.labels_files = sorted(os.listdir(labels_dir))
+        counts = [np.load(p, mmap_mode="r").shape[0] for p in self.feature_paths]
+        self.cumsum = np.cumsum(counts)
+        self.total = int(self.cumsum[-1])
+        self._features = None
+        self._labels = None
+
+    def _ensure_open(self):
+        if self._features is None:
+            self._features = [np.load(p, mmap_mode="r") for p in self.feature_paths]
+            self._labels = [np.load(p, mmap_mode="r") for p in self.label_paths]
 
     def __len__(self):
-        assert len(self.features_files) == len(self.labels_files), \
-            "Number of feature files and label files should be same"
-        return len(self.features_files)
+        return self.total
 
     def __getitem__(self, idx):
-        feature_file = self.features_files[idx]
-        label_file = self.labels_files[idx]
+        self._ensure_open()
+        shard = bisect.bisect_right(self.cumsum, idx)
+        offset = idx - (self.cumsum[shard - 1] if shard > 0 else 0)
 
-        features = np.load(os.path.join(self.features_dir, feature_file))
-        labels = np.load(os.path.join(self.labels_dir, label_file))
-        return torch.from_numpy(features), torch.from_numpy(labels)
+        x = np.array(self._features[shard][offset])   # copy just this sample
+        y = int(self._labels[shard][offset])
+        return torch.from_numpy(x).float(), y
+
+def resume_from_checkpoint(checkpoint_dir, model, ema, opt):
+    """
+    if any checkpoint under checkpoint_dir, use the latest one
+    return model, ema, opt, train_step, epoch
+    """
+    if len(os.listdir(checkpoint_dir)) == 0:
+        return model, ema, opt, 0, 0
+    else:
+        ckpt_files = sorted(os.listdir(checkpoint_dir), key= lambda i: int(os.path.splitext(i)[0]))
+        last_ckpt = ckpt_files[-1]
+        ckpt = torch.load(last_ckpt, map_location='cpu')
+        model.load_state_dict(ckpt['model'])
+        ema.load_state_dict(ckpt['ema'])
+        opt.load_state_dict(ckpt['opt'])
+        return model, ema, opt, ckpt['tran_steps'], ckpt['epoch']
 
 
 #################################################################################
@@ -128,18 +158,18 @@ def main(args):
 
     # Setup accelerator:
     accelerator = Accelerator()
+    set_seed(args.global_seed)
     device = accelerator.device
 
     # Setup an experiment folder:
-    if accelerator.is_main_process:
-        os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
-        experiment_index = len(glob(f"{args.results_dir}/*"))
-        model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
-        experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}"  # Create an experiment folder
-        checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        logger = create_logger(experiment_dir)
-        logger.info(f"Experiment directory created at {experiment_dir}")
+    os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
+    experiment_index = len(glob(f"{args.results_dir}/*"))
+    model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
+    experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}"  # Create an experiment folder
+    checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    logger = setup_logger(experiment_dir, accelerator.process_index)
+    logger.info(f"Experiment directory created at {experiment_dir}")
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -153,7 +183,7 @@ def main(args):
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    # vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device) # this never uses
     if accelerator.is_main_process:
         logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -163,7 +193,9 @@ def main(args):
     # Setup data:
     features_dir = f"{args.feature_path}/imagenet256_features"
     labels_dir = f"{args.feature_path}/imagenet256_labels"
+    logger.info("loading data")
     dataset = CustomDataset(features_dir, labels_dir)
+    logger.info("loading data done")
     loader = DataLoader(
         dataset,
         batch_size=int(args.global_batch_size // accelerator.num_processes),
@@ -177,26 +209,27 @@ def main(args):
 
     # Prepare models for training:
     update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
+    model, ema, opt, train_steps, start_epoch = resume_from_checkpoint(checkpoint_dir, model, ema, opt)
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
     model, opt, loader = accelerator.prepare(model, opt, loader)
 
     # Variables for monitoring/logging purposes:
-    train_steps = 0
     log_steps = 0
     running_loss = 0
     start_time = time()
     
-    if accelerator.is_main_process:
-        logger.info(f"Training for {args.epochs} epochs...")
-    for epoch in range(args.epochs):
-        if accelerator.is_main_process:
-            logger.info(f"Beginning epoch {epoch}...")
+    logger.info(f"Training for {args.epochs} epochs... start at {start_epoch}")
+    total_steps = len(loader) * (args.epochs-start_epoch)
+    logger.info(f"total training steps: {total_steps}")
+    timer = ContextTimer(total_steps = total_steps)
+    for epoch in range(start_epoch, args.epochs):
+        logger.info(f"Beginning epoch {epoch}...")
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)
-            x = x.squeeze(dim=1)
-            y = y.squeeze(dim=1)
+            # x = x.squeeze(dim=1)
+            # y = y.squeeze(dim=1)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
@@ -221,8 +254,7 @@ def main(args):
                 avg_loss = torch.tensor(avg_loss, device=accelerator.device)
                 avg_loss = accelerator.reduce(avg_loss, reduction="sum")
 
-                if accelerator.is_main_process:
-                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}| {timer.stats()}")
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
@@ -235,11 +267,14 @@ def main(args):
                         "model": model.module.state_dict(),
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
-                        "args": args
+                        "args": args,
+                        "train_steps": train_steps,
+                        "epoch": epoch,
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
+            timer.update()
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -263,5 +298,6 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--resume", action = "store_true", help="resume from ckpt")
     args = parser.parse_args()
     main(args)
