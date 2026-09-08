@@ -8,7 +8,7 @@
 A minimal training script for DiT using PyTorch DDP.
 
 Modification:
-    - save all features to one single npy file
+    - save all features to num shards of npy file
 """
 import os
 # Enable offline mode for Hugging Face Hub and Datasets
@@ -133,6 +133,15 @@ def create_dataset(dataset_path, transform):
 #################################################################################
 
 def main(args):
+
+    def flush(res_x, res_y, rank, index_shard):
+        if len(res_x) == 0:
+            return
+        x_npy = np.concatenate(res_x)
+        y_npy = np.concatenate(res_y)
+        np.save(f"{args.features_path}/imagenet256_features/rank-{rank}_shard-{index_shard:04d}_{'x'.join([str(i) for i in x_npy.shape])}.npy", x_npy)
+        np.save(f"{args.features_path}/imagenet256_labels/rank-{rank}_shard-{index_shard:04d}_{len(y_npy)}.npy", y_npy)
+
     """
     Trains a new DiT model.
     """
@@ -186,26 +195,31 @@ def main(args):
         drop_last=False
     )
 
-    NUM_SAMPLES = len(sampler)
+    res_x = []
+    res_y = []
+    num_samples = 0
+    index_shard = 0
 
-    train_steps = 0
     for x, y in tqdm(loader, total=len(loader), desc=f"Rank {rank}"):
         x = x.to(device)
         y = y.to(device)
         with torch.no_grad():
             # Map input images to latent space + normalize latents:
             x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+
+        res_x.append(x.cpu().numpy())
+        res_y.append(y.cpu().numpy())
+        num_samples += len(x)
+
+        if num_samples >= args.num_per_shard:
+            flush(res_x, res_y, rank, index_shard)
+            logger.info(f"rank {rank} saved shard {index_shard} ({num_samples} samples)", all=True)
+            res_x, res_y, num_samples = [], [], 0
+            index_shard += 1
             
-        x = x.detach().cpu().numpy()    # (bs, 4, 32, 32)
-        y = y.detach().cpu().numpy()    # (bs,)
-        for i in range(x.shape[0]):
-            # save_num = NUM_SAMPLES * rank + train_steps * local_batch_size + i
-            save_num = train_steps * args.global_batch_size + dist.get_world_size() * i + rank
-            np.save(f'{args.features_path}/imagenet256_features/{save_num}.npy', np.expand_dims(x[i], axis=0))
-            np.save(f'{args.features_path}/imagenet256_labels/{save_num}.npy', np.expand_dims(y[i], axis=0))
-            
-        train_steps += 1
         # print(save_num)
+    flush(res_x, res_y, rank, index_shard)
+    dist.barrier()
     logger.info('finished')
     cleanup()
 
@@ -213,7 +227,8 @@ if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
-    parser.add_argument("--features-path", type=str, default="features", help="path to .npy file", required=True)
+    parser.add_argument("--features-path", type=str, default="features", help="directory to save to", required=True)
+    parser.add_argument("--num_per_shard", type = int, default = 100000, help = "how many data each shard have")
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
