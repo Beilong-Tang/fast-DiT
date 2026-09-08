@@ -7,6 +7,10 @@
 """
 A minimal training script for DiT using PyTorch DDP.
 """
+import os
+# Enable offline mode for Hugging Face Hub and Datasets
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
 import torch
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -17,6 +21,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
+from torch.utils.data import Dataset
 import numpy as np
 from collections import OrderedDict
 from PIL import Image
@@ -25,12 +30,15 @@ from glob import glob
 from time import time
 import argparse
 import logging
-import os
 from tqdm import tqdm
+from functools import partial
 
 from models import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
+
+from blpytorch.utils.log import setup_logger
+from blpytorch.utils.cuda_tracker import get_gpu_stats
 
 
 #################################################################################
@@ -65,24 +73,6 @@ def cleanup():
     dist.destroy_process_group()
 
 
-def create_logger(logging_dir):
-    """
-    Create a logger that writes to a log file and stdout.
-    """
-    if dist.get_rank() == 0:  # real logger
-        logging.basicConfig(
-            level=logging.INFO,
-            format='[\033[34m%(asctime)s\033[0m] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
-        )
-        logger = logging.getLogger(__name__)
-    else:  # dummy logger (does nothing)
-        logger = logging.getLogger(__name__)
-        logger.addHandler(logging.NullHandler())
-    return logger
-
-
 def center_crop_arr(pil_image, image_size):
     """
     Center cropping implementation from ADM.
@@ -103,6 +93,37 @@ def center_crop_arr(pil_image, image_size):
     crop_x = (arr.shape[1] - image_size) // 2
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
+class HFImageFolder(Dataset):
+    """Mimics torchvision ImageFolder, backed by a HuggingFace dataset."""
+
+    def __init__(self, hf_dataset, transform):
+        self.ds = hf_dataset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        sample = self.ds[idx]
+        img = sample["image"].convert("RGB")
+        target = sample["label"]
+        img = self.transform(img)
+        return img, target
+
+def create_dataset(dataset_path, transform):
+    """
+    create dataset based on the dataset_path
+        - folder ->  ImageDataset
+        - *.parquet - hf dataset
+    """
+    if os.path.isdir(dataset_path):
+        return ImageFolder(args.data_path, transform=transform)
+    elif dataset_path.endswith("parquet"):
+        from datasets import load_dataset
+        ds = load_dataset("parquet", data_files={"train": dataset_path})
+        return HFImageFolder(ds['train'], transform=transform)
+    else:
+        raise ValueError(f"invalid dataset_path: {dataset_path}")
 
 #################################################################################
 #                                  Training Loop                                #
@@ -118,11 +139,12 @@ def main(args):
     dist.init_process_group("nccl")
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
     rank = dist.get_rank()
+    logger = setup_logger(log_dir='logs/extract_latents', rank = rank)
     device = rank % torch.cuda.device_count()
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    logger.info(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.", all=True)
 
     # Setup a feature folder:
     if rank == 0:
@@ -138,12 +160,12 @@ def main(args):
     # Setup data:
     local_batch_size = args.global_batch_size // dist.get_world_size()
     transform = transforms.Compose([
-        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
+        transforms.Lambda(partial(center_crop_arr, image_size=args.image_size)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
-    dataset = ImageFolder(args.data_path, transform=transform)
+    dataset = create_dataset(args.data_path, transform=transform)
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -181,7 +203,7 @@ def main(args):
             
         train_steps += 1
         # print(save_num)
-
+    logger.info('finished')
     cleanup()
 
 if __name__ == "__main__":
