@@ -13,6 +13,7 @@ def parse_args():
     parser.add_argument("tgt_dir", type = str)
     parser.add_argument("--sleep_time", type = int, default = 30, help='check frequency in seconds')
     parser.add_argument("--num_files_keep", type = int, default = 1, help='num files to keep in the src_dir')
+    args = parser.parse_args()
     return args
 
 def main(args):
