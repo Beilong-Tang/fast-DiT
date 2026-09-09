@@ -28,7 +28,7 @@ def main(args):
             for index, f in enumerate(files):
                 if index < remove_index:
                     shutil.move(f, args.tgt_dir)
-            time.sleep(args.sleep_time)
+        time.sleep(args.sleep_time)
     
 
 if __name__ == "__main__":
