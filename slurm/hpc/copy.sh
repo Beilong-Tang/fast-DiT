@@ -24,4 +24,4 @@ set -e
 source /usr/local/apps/conda/miniconda3/26.3.2/etc/profile.d/conda.sh
 conda activate /usr/local/usrapps/m1/btang5/envs/DiT
 
-python -u slurm/hpc/copy.py results/000-DiT-XL-2/checkpoints/  /gpfs_common/share01/m1/btang5/workspace/fast_dit/vae_ema_latents_hf/dit_xl2_checkpoints
+python -u slurm/hpc/copy.py results/000-DiT-XL-2/checkpoints  /gpfs_common/share01/m1/btang5/workspace/fast_dit/vae_ema_latents_hf/results/000-DiT-XL-2/checkpoints

@@ -23,12 +23,12 @@ def main(args):
         files = glob.glob(os.path.join(args.src_dir, "*.pt"))
         files = sorted(files, key=lambda x: int(Path(x).stem))
         print(f"{datetime.datetime.now()} - found files {files}")
-        for index, f in enumerate(files):
-            if index < args.num_files_keep:
-                pass
-            else:
-                shutil.move(f, args.tgt_dir)
-        time.sleep(args.sleep_time)
+        if len(files) > args.num_files_keep:
+            remove_index = len(files) - args.num_files_keep
+            for index, f in enumerate(files):
+                if index < remove_index:
+                    shutil.move(f, args.tgt_dir)
+            time.sleep(args.sleep_time)
     
 
 if __name__ == "__main__":
