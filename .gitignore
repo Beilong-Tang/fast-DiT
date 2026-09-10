@@ -225,3 +225,4 @@ samples/
 hpc_logs
 
 gpu_usage.log
+gpu_usage/
