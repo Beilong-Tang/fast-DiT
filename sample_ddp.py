@@ -24,26 +24,47 @@ from PIL import Image
 import numpy as np
 import math
 import argparse
+from pathlib import Path
 from blpytorch.utils.log import setup_logger
 from blpytorch.utils.cuda_tracker import get_gpu_stats
+import shutil
+import glob
 
 
-def create_npz_from_sample_folder(sample_dir, num=50_000):
+def create_npz_from_sample_folder(sample_dir, num=50_000, delete = True):
     """
     Builds a single .npz file from a folder of .png samples.
     """
     samples = []
-    for i in tqdm(range(num), desc="Building .npz file from samples"):
-        sample_pil = Image.open(f"{sample_dir}/{i:06d}.png")
-        sample_np = np.asarray(sample_pil).astype(np.uint8)
+    files = glob.glob(f"{sample_dir}/*.npy")
+    print(files)
+    for f in tqdm(files, desc="Building .npz file from samples"):
+        sample_np = np.load(f)
         samples.append(sample_np)
-    samples = np.stack(samples)
+    samples = np.concatenate(samples)
+    print(samples.shape)
+    samples = samples[:num]
     assert samples.shape == (num, samples.shape[1], samples.shape[2], 3)
     npz_path = f"{sample_dir}.npz"
     np.savez(npz_path, arr_0=samples)
+    if delete:
+        shutil.rmtree(sample_dir)
     print(f"Saved .npz file to {npz_path} [shape={samples.shape}].")
     return npz_path
 
+def calculate_len_exist_samples_and_start_index(sample_folder_dir, rank):
+    exist_samples = [f for f in os.listdir(sample_folder_dir) if f.endswith("npy")]
+    len_exist_samples = 0
+    for f in exist_samples:
+        bs = int((Path(f).stem.split('-')[-1]).split('x')[0])
+        len_exist_samples += bs
+    rank_files = [f for f in exist_samples if f.startswith(f"rank_{rank}")]
+    rank_files_sorted = sorted(rank_files, key=lambda i: int(i.split('_')[3]))
+    if rank_files_sorted:
+        start_index = int(rank_files_sorted[-1].split('_')[3]) + 1
+    else:
+        start_index = 0
+    return len_exist_samples, start_index
 
 def main(args):
     """
@@ -94,7 +115,7 @@ def main(args):
         os.makedirs(sample_folder_dir, exist_ok=True)
         logger.info(f"Saving .png samples at {sample_folder_dir}")
     dist.barrier()
-    len_exist_samples = len(os.listdir(sample_folder_dir))
+    len_exist_samples, start_index = calculate_len_exist_samples_and_start_index(sample_folder_dir, rank)
     seed = args.global_seed * dist.get_world_size() + rank + len_exist_samples
     torch.manual_seed(seed)
 
@@ -142,16 +163,15 @@ def main(args):
         samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
 
         # Save samples to disk as individual .png files
-        for i, sample in enumerate(samples):
-            index = i * dist.get_world_size() + rank + total
-            Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
+        np.save(f"{sample_folder_dir}/rank_{rank}_iter_{start_index:06d}_sample-{'x'.join([str(i) for i in samples.shape])}.npy", samples)
+        start_index += 1
         total += global_batch_size
         logger.info(f"finished: {(index+1)/len(pbar)}, rate: {time.time() - time_start:.2f} sec/step, {gpu_stats}")
 
     # Make sure all processes have finished saving their samples before attempting to convert to .npz
     dist.barrier()
     if rank == 0:
-        create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples)
+        create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples, delete=True)
         logger.info("Done.")
     dist.barrier()
     dist.destroy_process_group()
